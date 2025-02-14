@@ -6,8 +6,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
+	"github.com/docker/buildx/util/osutil"
 	"github.com/pkg/errors"
 )
 
@@ -48,7 +50,7 @@ func New(opts ...Option) (*Git, error) {
 
 	c.gitpath, err = gitPath(c.wd)
 	if err != nil {
-		return nil, errors.New("git not found in PATH")
+		return nil, err
 	}
 
 	return c, nil
@@ -65,11 +67,29 @@ func (c *Git) IsDirty() bool {
 }
 
 func (c *Git) RootDir() (string, error) {
-	return c.clean(c.run("rev-parse", "--show-toplevel"))
+	root, err := c.clean(c.run("rev-parse", "--show-toplevel"))
+	if err != nil {
+		return "", err
+	}
+	return osutil.SanitizePath(root), nil
+}
+
+func (c *Git) GitDir() (string, error) {
+	dir, err := c.RootDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, ".git"), nil
 }
 
 func (c *Git) RemoteURL() (string, error) {
-	// Try to get the remote URL from the origin remote first
+	// Try default remote based on remote tracking branch
+	if remote, err := c.currentRemote(); err == nil && remote != "" {
+		if ru, err := c.clean(c.run("remote", "get-url", remote)); err == nil && ru != "" {
+			return stripCredentials(ru), nil
+		}
+	}
+	// Next try to get the remote URL from the origin remote first
 	if ru, err := c.clean(c.run("remote", "get-url", "origin")); err == nil && ru != "" {
 		return stripCredentials(ru), nil
 	}
@@ -138,6 +158,22 @@ func (c *Git) clean(out string, err error) (string, error) {
 		err = errors.New(strings.TrimSuffix(err.Error(), "\n"))
 	}
 	return out, err
+}
+
+func (c *Git) currentRemote() (string, error) {
+	symref, err := c.clean(c.run("symbolic-ref", "-q", "HEAD"))
+	if err != nil {
+		return "", err
+	}
+	if symref == "" {
+		return "", nil
+	}
+	// git for-each-ref --format='%(upstream:remotename)'
+	remote, err := c.clean(c.run("for-each-ref", "--format=%(upstream:remotename)", symref))
+	if err != nil {
+		return "", err
+	}
+	return remote, nil
 }
 
 func IsUnknownRevision(err error) bool {

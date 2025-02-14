@@ -18,16 +18,16 @@ type Process struct {
 	invokeConfig  *pb.InvokeConfig
 	errCh         chan error
 	processCancel func()
-	serveIOCancel func()
+	serveIOCancel func(error)
 }
 
 // ForwardIO forwards process's io to the specified reader/writer.
 // Optionally specify ioCancelCallback which will be called when
 // the process closes the specified IO. This will be useful for additional cleanup.
-func (p *Process) ForwardIO(in *ioset.In, ioCancelCallback func()) {
+func (p *Process) ForwardIO(in *ioset.In, ioCancelCallback func(error)) {
 	p.inEnd.SetIn(in)
 	if f := p.serveIOCancel; f != nil {
-		f()
+		f(errors.WithStack(context.Canceled))
 	}
 	p.serveIOCancel = ioCancelCallback
 }
@@ -98,7 +98,7 @@ func (m *Manager) DeleteProcess(id string) error {
 // When a container isn't available (i.e. first time invoking or the container has exited) or cfg.Rollback is set,
 // this method will start a new container and run the process in it. Otherwise, this method starts a new process in the
 // existing container.
-func (m *Manager) StartProcess(pid string, resultCtx *build.ResultContext, cfg *pb.InvokeConfig) (*Process, error) {
+func (m *Manager) StartProcess(pid string, resultCtx *build.ResultHandle, cfg *pb.InvokeConfig) (*Process, error) {
 	// Get the target result to invoke a container from
 	var ctr *build.Container
 	if a := m.container.Load(); a != nil {
@@ -111,7 +111,7 @@ func (m *Manager) StartProcess(pid string, resultCtx *build.ResultContext, cfg *
 			go ctr.Cancel() // Finish the existing container
 		}
 		var err error
-		ctr, err = build.NewContainer(context.TODO(), resultCtx)
+		ctr, err = build.NewContainer(context.TODO(), resultCtx, cfg)
 		if err != nil {
 			return nil, errors.Errorf("failed to create container %v", err)
 		}
@@ -124,9 +124,16 @@ func (m *Manager) StartProcess(pid string, resultCtx *build.ResultContext, cfg *
 	f.SetOut(&out)
 
 	// Register process
-	ctx, cancel := context.WithCancel(context.TODO())
+	ctx, cancel := context.WithCancelCause(context.TODO())
 	var cancelOnce sync.Once
-	processCancelFunc := func() { cancelOnce.Do(func() { cancel(); f.Close(); in.Close(); out.Close() }) }
+	processCancelFunc := func() {
+		cancelOnce.Do(func() {
+			cancel(errors.WithStack(context.Canceled))
+			f.Close()
+			in.Close()
+			out.Close()
+		})
+	}
 	p := &Process{
 		inEnd:         f,
 		invokeConfig:  cfg,
@@ -137,7 +144,7 @@ func (m *Manager) StartProcess(pid string, resultCtx *build.ResultContext, cfg *
 	go func() {
 		var err error
 		if err = ctr.Exec(ctx, cfg, in.Stdin, in.Stdout, in.Stderr); err != nil {
-			logrus.Errorf("failed to exec process: %v", err)
+			logrus.Debugf("process error: %v", err)
 		}
 		logrus.Debugf("finished process %s %v", pid, cfg.Entrypoint)
 		m.processes.Delete(pid)
